@@ -8,12 +8,12 @@
 #
 # Execution examples:
 #  - pp PYTHIA jets, 2 events, triggered on high pT decay photons on all barrel calorimeters acceptance, eCMS 13 TeV
-#     ./o2dpg_sim_workflow.py -e TGeant3 -ns 2 -j 8 -tf 1 -mod "--skipModules ZDC" -col pp -eCM 13000 \
+#     ./o2dpg_sim_workflow.py -e TGeant3 -ns 2 -j 8 -tf 1 -col pp -eCM 13000 \
 #                             -proc "jets" -ptHatBin 3 \
 #                             -trigger "external" -ini "\$O2DPG_ROOT/MC/config/PWGGAJE/ini/trigger_decay_gamma_allcalo_TrigPt3_5.ini"
 #
 #  - pp PYTHIA ccbar events embedded into heavy-ion environment, 2 PYTHIA events into 1 bkg event, beams energy 2.510
-#     ./o2dpg_sim_workflow.py -e TGeant3 -nb 1 -ns 2 -j 8 -tf 1 -mod "--skipModules ZDC"  \
+#     ./o2dpg_sim_workflow.py -e TGeant3 -nb 1 -ns 2 -j 8 -tf 1  \
 #                             -col pp -eA 2.510 -proc "ccbar"  --embedding
 #
 
@@ -108,7 +108,8 @@ parser.add_argument('-j', '--n-workers', dest='n_workers', help='number of worke
 parser.add_argument('--force-n-workers', dest='force_n_workers', action='store_true', help='by default, number of workers is re-computed '
                                                                                            'for given interaction rate; '
                                                                                            'pass this to avoid that')
-parser.add_argument('-mod',help='Active modules (deprecated)', default='--skipModules ZDC')
+parser.add_argument('--skipModules',nargs="*", help="List of modules to skip in geometry budget (and therefore processing)", default=["ZDC"])
+parser.add_argument('--skipReadout',nargs="*", help="List of modules to take out from readout", default=[""])
 parser.add_argument('--with-ZDC', action='store_true', help='Enable ZDC in workflow')
 parser.add_argument('-seed',help='random seed number', default=None)
 parser.add_argument('-o',help='output workflow file', default='workflow.json')
@@ -124,6 +125,7 @@ parser.add_argument('--early-tf-cleanup',action='store_true', help='whether to c
 # power features (for playing) --> does not appear in help message
 #  help='Treat smaller sensors in a single digitization')
 parser.add_argument('--pregenCollContext', action='store_true', help=argparse.SUPPRESS) # Now the default, giving this option or not makes not difference. We keep it for backward compatibility
+parser.add_argument('--data-anchoring', type=str, default='', help="Take collision contexts (from data) stored in this path")
 parser.add_argument('--no-combine-smaller-digi', action='store_true', help=argparse.SUPPRESS)
 parser.add_argument('--no-combine-dpl-devices', action='store_true', help=argparse.SUPPRESS)
 parser.add_argument('--no-mc-labels', action='store_true', default=False, help=argparse.SUPPRESS)
@@ -256,6 +258,19 @@ with open(config_key_param_path, "w") as f:
    print(f"INFO: Written additional config key parameters to JSON {config_key_param_path}")
    json.dump(anchorConfig, f, indent=2)
 
+# Processing skipped material budget (modules):
+# - If user did NOT specify --with-ZDC
+# - AND ZDC is not already in the list
+# --> append ZDC automatically
+if args.with_ZDC:
+   # User wants ZDC to *not* be skipped → ensure it's removed
+   args.skipModules = [m for m in args.skipModules if m != "ZDC"]
+else:
+   # If user did not request --with-ZDC,
+   # auto-append ZDC unless already present
+   if "ZDC" not in args.skipModules:
+      args.skipModules.append("ZDC")
+
 # with this we can tailor the workflow to the presence of
 # certain detectors
 # these are all detectors that should be assumed active
@@ -266,14 +281,14 @@ if activeDetectors == 'all':
     # if "all" here, there was in fact nothing in the anchored script, set to what is passed to this script (which it either also "all" or a subset)
     activeDetectors = readout_detectors
 elif readout_detectors != 'all' and activeDetectors != 'all':
-    # in this case both are comma-seperated lists. Take intersection
+    # in this case both are comma-separated lists. Take intersection
     r = set(readout_detectors.split(','))
     a = set(activeDetectors.split(','))
     activeDetectors = ','.join(r & a)
 # the last case: simply take what comes from the anchored config
 
 # convert to set/hashmap
-activeDetectors = { det:1 for det in activeDetectors.split(',') }
+activeDetectors = { det:1 for det in activeDetectors.split(',') if det not in args.skipModules and det not in args.skipReadout}
 for det in activeDetectors:
     activate_detector(det)
 
@@ -407,7 +422,9 @@ if args.timestamp==-1:
 
 NTIMEFRAMES=int(args.tf)
 NWORKERS=args.n_workers
-MODULES = "--skipModules ZDC" if not isActive("ZDC") else ""
+
+
+SKIPMODULES = " ".join(["--skipModules"] + args.skipModules) if len(args.skipModules) > 0 else ""
 SIMENGINE=args.e
 BFIELD=args.field
 RNDSEED=args.seed # typically the argument should be the jobid, but if we get None the current time is used for the initialisation
@@ -623,7 +640,8 @@ PreCollContextTask['cmd']='${O2_ROOT}/bin/o2-steer-colcontexttool -i ' + interac
                             + ' --extract-per-timeframe tf:sgn'                                                            \
                             + ' --with-vertices ' + vtxmode_precoll                                                        \
                             + ' --maxCollsPerTF ' + str(args.ns)                                                           \
-                            + ' --orbitsEarly ' + str(args.orbits_early)
+                            + ' --orbitsEarly ' + str(args.orbits_early)                                                   \
+                            + ('',f" --import-external {args.data_anchoring}")[len(args.data_anchoring) > 0]
 
 PreCollContextTask['cmd'] += ' --bcPatternFile ccdb'  # <--- the object should have been set in (local) CCDB
 if includeQED:
@@ -714,7 +732,7 @@ if doembedding:
         bkgsimneeds = [BKG_CONFIG_task['name'], GRP_TASK['name'], PreCollContextTask['name']]
         BKGtask=createTask(name='bkgsim', lab=["GEANT"], needs=bkgsimneeds, cpu=NWORKERS)
         BKGtask['cmd']='${O2_ROOT}/bin/o2-sim -e ' + SIMENGINE   + ' -j ' + str(NWORKERS) + ' -n '     + str(NBKGEVENTS) \
-                     + ' -g  '      + str(GENBKG) + ' '    + str(MODULES)  + ' -o bkg ' + str(INIBKG)                    \
+                     + ' -g  '      + str(GENBKG) + ' '    + str(SKIPMODULES)  + ' -o bkg ' + str(INIBKG)                \
                      + ' --field ccdb ' + str(CONFKEYBKG)                                                                \
                      + ('',' --timestamp ' + str(args.timestamp))[args.timestamp!=-1] + ' --run ' + str(args.run)        \
                      + ' --vertexMode ' + vtxmode_sgngen                                                                 \
@@ -945,7 +963,7 @@ for tf in range(1, NTIMEFRAMES + 1):
    sgnmem = 6000 if COLTYPE == 'PbPb' else 4000
    SGNtask=createTask(name='sgnsim_'+str(tf), needs=signalneeds, tf=tf, cwd='tf'+str(tf), lab=["GEANT"],
                       relative_cpu=7/8, n_workers=NWORKERS_TF, mem=str(sgnmem))
-   sgncmdbase = '${O2_ROOT}/bin/o2-sim -e ' + str(SIMENGINE) + ' '  + str(MODULES) + ' -n ' + str(NSIGEVENTS) + ' --seed ' + str(TFSEED)       \
+   sgncmdbase = '${O2_ROOT}/bin/o2-sim -e ' + str(SIMENGINE) + ' '  + str(SKIPMODULES) + ' -n ' + str(NSIGEVENTS) + ' --seed ' + str(TFSEED)      \
               + ' --field ccdb -j ' + str(NWORKERS_TF) + ' ' + str(CONFKEY) + ' ' + str(INIFILE) + ' -o ' + signalprefix + ' ' + embeddinto       \
               + ' --detectorList ' + args.detectorList                                                                                            \
               + ('', ' --timestamp ' + str(args.timestamp))[args.timestamp!=-1] + ' --run ' + str(args.run)
@@ -1105,6 +1123,7 @@ for tf in range(1, NTIMEFRAMES + 1):
                          + ' --onlyDet TPC --TPCuseCCDB --interactionRate ' + str(INTRATE) + '  --tpc-lanes ' + str(NWORKERS_TF)             \
                          + ' --incontext ' + str(CONTEXTFILE) + ' --disable-write-ini --early-forward-policy always --forceSelectedDets ' \
                          + ' --tpc-distortion-type ' + str(tpcDistortionType)                                                             \
+                         + ' --n-threads-distortions 1 '                                                                                  \
                          + putConfigValues(["TPCGasParam","TPCGEMParam","TPCEleParam","TPCITCorr","TPCDetParam"],
                                               localCF=tpcLocalCF)
    TPCDigitask['cmd'] += (' --tpc-chunked-writer','')[args.no_tpc_digitchunking]
@@ -1427,7 +1446,7 @@ for tf in range(1, NTIMEFRAMES + 1):
                        TPCRECOtask['name'],
                        ITSTPCMATCHtask['name'],
                        TRDTRACKINGtask2['name'] if isActive("TRD") else None]
-   toftracksrcdefault = dpl_option_from_config(anchorConfig, 'o2-tof-matcher-workflow', '--track-sources', default_value='TPC,ITS-TPC,TPC-TRD,ITS-TPC-TRD')
+   toftracksrcdefault = cleanDetectorInputList(dpl_option_from_config(anchorConfig, 'o2-tof-matcher-workflow', '--track-sources', default_value='TPC,ITS-TPC,TPC-TRD,ITS-TPC-TRD'))
    tofusefit = option_if_available('o2-tof-matcher-workflow', '--use-fit', envfile=async_envfile)
    TOFTPCMATCHERtask = createTask(name='toftpcmatch_'+str(tf), needs=toftpcmatchneeds, tf=tf, cwd=timeframeworkdir, lab=["RECO"], mem='1000')
    tofmatcher_cmd_parts = [
@@ -1495,7 +1514,8 @@ for tf in range(1, NTIMEFRAMES + 1):
    MIDRECOtask['cmd'] += task_finalizer(['${O2_ROOT}/bin/o2-mid-reco-workflow', 
                                              getDPL_global_options(), 
                                              putConfigValues(),('',' --disable-mc')[args.no_mc_labels]])
-   workflow['stages'].append(MIDRECOtask)
+   if isActive('MID'):
+      workflow['stages'].append(MIDRECOtask)
 
    #<--------- FDD reco workflow
    FDDRECOtask = createTask(name='fddreco_'+str(tf), needs=[getDigiTaskName("FDD")], tf=tf, cwd=timeframeworkdir, lab=["RECO"], mem='1500')
@@ -1583,15 +1603,19 @@ for tf in range(1, NTIMEFRAMES + 1):
        getDPL_global_options(ccdbbackend=False),
        putConfigValues(),
        ('',' --disable-mc')[args.no_mc_labels]])
-   workflow['stages'].append(MCHMIDMATCHtask)
+   if isActive("MID") and isActive("MCH"):
+      workflow['stages'].append(MCHMIDMATCHtask)
 
    #<--------- MFT-MCH forward matching
-   MFTMCHMATCHtask = createTask(name='mftmchMatch_'+str(tf), needs=[MCHMIDMATCHtask['name'], MFTRECOtask['name']], tf=tf, cwd=timeframeworkdir, lab=["RECO"], mem='1500')
+   forwardmatchneeds = [MCHRECOtask['name'],
+                        MFTRECOtask['name'],
+                        MCHMIDMATCHtask['name'] if isActive("MID") else None]
+   MFTMCHMATCHtask = createTask(name='mftmchMatch_'+str(tf), needs=forwardmatchneeds, tf=tf, cwd=timeframeworkdir, lab=["RECO"], mem='1500')
    MFTMCHMATCHtask['cmd'] = task_finalizer(
       ['${O2_ROOT}/bin/o2-globalfwd-matcher-workflow',
         putConfigValues(['ITSAlpideConfig',
                          'MFTAlpideConfig',
-                         'FwdMatching'],{"FwdMatching.useMIDMatch":"true"}),
+                         'FwdMatching'],{"FwdMatching.useMIDMatch": "true" if isActive("MID") else "false"}),
        ('',' --disable-mc')[args.no_mc_labels]])
 
    if args.fwdmatching_assessment_full == True:
