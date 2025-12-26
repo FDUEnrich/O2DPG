@@ -295,6 +295,8 @@ for det in activeDetectors:
 # function to finalize detector source lists based on activeDetectors
 # detector source lists are comma separated lists of DET1, DET2, DET1-DET2, ...
 def cleanDetectorInputList(inputlist):
+   if inputlist == "all":
+      return inputlist
    sources_list = inputlist.split(",")
    # Filter the sources
    filtered_sources = [
@@ -630,20 +632,7 @@ interactionspecification = signalprefix + ',' + str(INTRATE) + ',' + str(1000000
 if doembedding:
    interactionspecification = 'bkg,' + str(INTRATE) + ',' + str(NTIMEFRAMES*args.ns) + ':' + str(args.nb) + ' ' + signalprefix + ',' + args.embeddPattern
 
-PreCollContextTask['cmd']='${O2_ROOT}/bin/o2-steer-colcontexttool -i ' + interactionspecification                          \
-                            + ' --show-context '                                                                           \
-                            + ' --timeframeID ' + str(int(args.production_offset)*NTIMEFRAMES)                             \
-                            + ' --orbitsPerTF ' + str(orbitsPerTF)                                                         \
-                            + ' --orbits ' + str(NTIMEFRAMES * (orbitsPerTF))                                              \
-                            + ' --seed ' + str(RNDSEED)                                                                    \
-                            + ' --noEmptyTF --first-orbit ' + str(args.first_orbit)                                        \
-                            + ' --extract-per-timeframe tf:sgn'                                                            \
-                            + ' --with-vertices ' + vtxmode_precoll                                                        \
-                            + ' --maxCollsPerTF ' + str(args.ns)                                                           \
-                            + ' --orbitsEarly ' + str(args.orbits_early)                                                   \
-                            + ('',f" --import-external {args.data_anchoring}")[len(args.data_anchoring) > 0]
-
-PreCollContextTask['cmd'] += ' --bcPatternFile ccdb'  # <--- the object should have been set in (local) CCDB
+qedspec=""
 if includeQED:
    if PDGA==2212 or PDGB==2212:
       # QED is not enabled for pp and pA collisions
@@ -652,9 +641,28 @@ if includeQED:
    else:
       qedrate = INTRATE * QEDXSecExpected[COLTYPE] / XSecSys[COLTYPE]   # hadronic interaction rate * cross_section_ratio
       qedspec = 'qed' + ',' + str(qedrate) + ',10000000:' + str(NEventsQED)
-      PreCollContextTask['cmd'] += ' --QEDinteraction ' + qedspec
-workflow['stages'].append(PreCollContextTask)
 
+PreCollContextTask['cmd'] = task_finalizer([
+      '${O2_ROOT}/bin/o2-steer-colcontexttool',
+      f'-i {interactionspecification}',
+      '--show-context',
+      f'--timeframeID {int(args.production_offset)*NTIMEFRAMES}',
+      f'--orbitsPerTF {orbitsPerTF}',
+      f'--orbits {NTIMEFRAMES * (orbitsPerTF)}',
+      f'--seed {RNDSEED}',
+      '--noEmptyTF',
+      f'--first-orbit {args.first_orbit}',
+      '--extract-per-timeframe tf:sgn',
+      f'--with-vertices {vtxmode_precoll}',
+      f'--maxCollsPerTF {args.ns}',
+      f'--orbitsEarly {args.orbits_early}',
+      f'--timestamp {args.timestamp}',
+      f'--import-external {args.data_anchoring}' if len(args.data_anchoring) > 0 else None,
+      '--bcPatternFile ccdb',
+      f'--QEDinteraction {qedspec}' if includeQED else None
+      ], configname = 'precollcontext')
+workflow['stages'].append(PreCollContextTask)
+#TODO: in future add standard ' --nontrivial-mu-distribution ccdb://http://ccdb-test.cern.ch:8080/GLO/CALIB/EVSELQA/HBCTVX'
 
 if doembedding:
     if not usebkgcache:
@@ -1376,13 +1384,13 @@ for tf in range(1, NTIMEFRAMES + 1):
    workflow['stages'].append(FT0RECOtask)
 
    #<--------- ITS-TPC track matching task 
-   ITSTPCMATCHtask=createTask(name='itstpcMatch_'+str(tf), needs=[TPCRECOtask['name'], ITSRECOtask['name'], FT0RECOtask['name']], tf=tf, cwd=timeframeworkdir, lab=["RECO"], mem='8000', relative_cpu=3/8)
+   ITSTPCMATCHtask=createTask(name='itstpcMatch_'+str(tf), needs=[TPCRECOtask['name'], ITSRECOtask['name'], FT0RECOtask['name'] if isActive("FT0") else None], tf=tf, cwd=timeframeworkdir, lab=["RECO"], mem='8000', relative_cpu=3/8)
    ITSTPCMATCHtask["cmd"] = task_finalizer([
      '${O2_ROOT}/bin/o2-tpcits-match-workflow',
      getDPL_global_options(bigshm=True),
      ' --tpc-track-reader tpctracks.root',
      '--tpc-native-cluster-reader \"--infile tpc-native-clusters.root\"',
-     '--use-ft0',
+     '--use-ft0' if isActive("FT0") else None,
      putConfigValues(['MFTClustererParam', 
                       'ITSCATrackerParam', 
                       'tpcitsMatch', 
@@ -1462,7 +1470,7 @@ for tf in range(1, NTIMEFRAMES + 1):
                       'trackTuneParams'], tpcLocalCFreco),
      ' --track-sources ' + toftracksrcdefault,
      (' --combine-devices','')[args.no_combine_dpl_devices],
-     tofusefit,
+     tofusefit if isActive("FT0") else None,
      tpc_corr_scaling_options,
      tpc_corr_options_mc
    ]
@@ -1487,7 +1495,8 @@ for tf in range(1, NTIMEFRAMES + 1):
                        'MFTClustererParam']),
       ('','--disable-mc')[args.no_mc_labels],
       ('','--run-assessment')[args.mft_assessment_full]])
-   workflow['stages'].append(MFTRECOtask)
+   if isActive("MFT"):
+      workflow['stages'].append(MFTRECOtask)
 
    # MCH reco: needing access to kinematics ... so some extra logic needed here
    mchreconeeds = [getDigiTaskName("MCH")]
@@ -1608,7 +1617,7 @@ for tf in range(1, NTIMEFRAMES + 1):
 
    #<--------- MFT-MCH forward matching
    forwardmatchneeds = [MCHRECOtask['name'],
-                        MFTRECOtask['name'],
+                        MFTRECOtask['name'] if isActive("MFT") else None,
                         MCHMIDMATCHtask['name'] if isActive("MID") else None]
    MFTMCHMATCHtask = createTask(name='mftmchMatch_'+str(tf), needs=forwardmatchneeds, tf=tf, cwd=timeframeworkdir, lab=["RECO"], mem='1500')
    MFTMCHMATCHtask['cmd'] = task_finalizer(
@@ -1871,21 +1880,22 @@ for tf in range(1, NTIMEFRAMES + 1):
      ### MFT
 
      # to be enabled once MFT Digits should run 5 times with different configurations
-     for flp in range(5):
-       addQCPerTF(taskName='mftDigitsQC' + str(flp),
-                  needs=[getDigiTaskName("MFT")],
-                  readerCommand='o2-qc-mft-digits-root-file-reader --mft-digit-infile=mftdigits.root',
-                  configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/mft-digits-' + str(flp) + '.json',
-                  objectsFile='mftDigitsQC.root')
-     addQCPerTF(taskName='mftClustersQC',
+     if isActive("MFT"):
+       for flp in range(5):
+         addQCPerTF(taskName='mftDigitsQC' + str(flp),
+                    needs=[getDigiTaskName("MFT")],
+                    readerCommand='o2-qc-mft-digits-root-file-reader --mft-digit-infile=mftdigits.root',
+                    configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/mft-digits-' + str(flp) + '.json',
+                    objectsFile='mftDigitsQC.root')
+       addQCPerTF(taskName='mftClustersQC',
                 needs=[MFTRECOtask['name']],
                 readerCommand='o2-global-track-cluster-reader --track-types none --cluster-types MFT',
                 configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/mft-clusters.json')
-     addQCPerTF(taskName='mftTracksQC',
+       addQCPerTF(taskName='mftTracksQC',
                 needs=[MFTRECOtask['name']],
                 readerCommand='o2-global-track-cluster-reader --track-types MFT --cluster-types MFT',
                 configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/mft-tracks.json')
-     addQCPerTF(taskName='mftMCTracksQC',
+       addQCPerTF(taskName='mftMCTracksQC',
                 needs=[MFTRECOtask['name']],
                 readerCommand='o2-global-track-cluster-reader --track-types MFT --cluster-types MFT',
                 configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/mft-tracks-mc.json')
@@ -1956,22 +1966,25 @@ for tf in range(1, NTIMEFRAMES + 1):
                       readerCommand='o2-emcal-cell-reader-workflow --infile emccells.root | o2-ctp-digit-reader --inputfile ctpdigits.root --disable-mc',
                       configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/emc-bc-task.json')
      ### FT0
-     addQCPerTF(taskName='RecPointsQC',
-                needs=[FT0RECOtask['name']],
-                readerCommand='o2-ft0-recpoints-reader-workflow --infile o2reco_ft0.root',
-                configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/ft0-reconstruction-config.json')
+     if isActive("FT0"):
+        addQCPerTF(taskName='RecPointsQC',
+                   needs=[FT0RECOtask['name']],
+                   readerCommand='o2-ft0-recpoints-reader-workflow --infile o2reco_ft0.root',
+                   configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/ft0-reconstruction-config.json')
 
      ### FV0
-     addQCPerTF(taskName='FV0DigitsQC',
-                needs=[getDigiTaskName("FV0")],
-                readerCommand='o2-fv0-digit-reader-workflow --fv0-digit-infile fv0digits.root',
-                configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/fv0-digits.json')
+     if isActive("FV0"):
+        addQCPerTF(taskName='FV0DigitsQC',
+                   needs=[getDigiTaskName("FV0")],
+                   readerCommand='o2-fv0-digit-reader-workflow --fv0-digit-infile fv0digits.root',
+                   configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/fv0-digits.json')
 
      ### FDD
-     addQCPerTF(taskName='FDDRecPointsQC',
-                needs=[FDDRECOtask['name']],
-                readerCommand='o2-fdd-recpoints-reader-workflow --fdd-recpoints-infile o2reco_fdd.root',
-                configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/fdd-recpoints.json')
+     if isActive("FDD"):
+        addQCPerTF(taskName='FDDRecPointsQC',
+                   needs=[FDDRECOtask['name']],
+                   readerCommand='o2-fdd-recpoints-reader-workflow --fdd-recpoints-infile o2reco_fdd.root',
+                   configFilePath='json://${O2DPG_ROOT}/MC/config/QC/json/fdd-recpoints.json')
 
      ### GLO + RECO
      addQCPerTF(taskName='vertexQC',
@@ -2073,7 +2086,9 @@ for tf in range(1, NTIMEFRAMES + 1):
    tpctsneeds = [ TPCRECOtask['name'],
                   ITSTPCMATCHtask['name'],
                   TOFTPCMATCHERtask['name'],
-                  PVFINDERtask['name']
+                  FT0RECOtask['name'],
+                  PVFINDERtask['name'],
+                  TRDTRACKINGtask2['name']
                 ]
    TPCTStask = createTask(name='tpctimeseries_'+str(tf), needs=tpctsneeds, tf=tf, cwd=timeframeworkdir, lab=["RECO"], mem='2000', cpu='1')
    TPCTStask['cmd'] = 'o2-global-track-cluster-reader --disable-mc --cluster-types "FT0,TOF,TPC" --track-types "ITS,TPC,ITS-TPC,ITS-TPC-TOF,ITS-TPC-TRD-TOF"'
